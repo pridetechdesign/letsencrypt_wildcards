@@ -1,0 +1,128 @@
+---
+## This playbook is designed to be executed on localhost,  
+## but can be changed
+- hosts: localhost
+## Gather server specific variables, such as a custom SSH port 
+## needed for rsync at the end, and the domain name we're 
+## deploying a certificate for. This can and should be automated
+## to suit your particular workflow.
+  vars_prompt:
+    - name: "api_key"
+      prompt: "What is the GoDaddy API Key?"
+    - name: "api_secret"
+      prompt: "What is the GoDaddy API Secret?"
+    - name: "ssl_domain"
+      prompt: "What is the SSL Domain?"
+    - name: "ssl_domain_port"
+      prompt: "What is the SSH Port?"
+
+  tasks:
+
+## This directory will be used as a master location for all our domains
+    - name: Create lets encrypt directory
+      file:
+        path: /etc/ssl/le
+        state: directory
+        owner: root
+        group: root
+        mode: "u=rwx,g=,o="
+
+## This creates a location for the specific domain we're deploying for
+    - name: Create domain directory
+      file:
+        path: /etc/ssl/le/{{ ssl_domain }}
+        state: directory
+        owner: root
+        group: root
+        mode: "u=rwx,g=,o="
+
+## You don't have to use the same filenames that I did. Extensions like .key,
+## .pem, etc are all for user-friendliness and can be anything you prefer.
+    - name: Create account key
+      shell: openssl genrsa 4096 > /etc/ssl/le/{{ ssl_domain }}/account.key
+      args:
+        creates: /etc/ssl/le/{{ ssl_domain }}/account.key
+
+    - name: Create domain key
+      shell: openssl genrsa 4096 > /etc/ssl/le/{{ ssl_domain }}/domain.key
+      args:
+        creates: /etc/ssl/le/{{ ssl_domain }}/domain.key
+
+## Create a CSR for both domain.tld and *.domain.tld
+    - name: Create multi-domain CSR
+      shell: openssl req -new -sha256 -key /etc/ssl/le/{{ ssl_domain }}/domain.key -subj "/" -reqexts SAN -config <(cat /etc/ssl/openssl.cnf <(printf "[SAN]\nsubjectAltName=DNS:{{ ssl_domain }},DNS:*.{{ ssl_domain }}")) > /etc/ssl/le/{{ ssl_domain }}/csr
+      args:
+        creates: /etc/ssl/le/{{ ssl_domain }}/csr
+        executable: /bin/bash
+
+## Here we create our ACME challenge using our CSR and register a variable. 
+## I've included both the production and staging directories, you should use 
+## the staging directory for testing.
+    - name: Create challenge
+      letsencrypt:
+        account_key_src: /etc/ssl/le/{{ ssl_domain }}/account.key
+        csr: /etc/ssl/le/{{ ssl_domain }}/csr
+        dest: /etc/ssl/le/{{ ssl_domain }}/certificate.crt
+        fullchain_dest: /etc/ssl/le/{{ ssl_domain }}/fullchain.crt
+        chain_dest: /etc/ssl/le/{{ ssl_domain }}/intermediate.crt
+        challenge: dns-01
+        acme_directory: https://acme-v02.api.letsencrypt.org/directory
+        # acme_directory: https://acme-staging-v02.api.letsencrypt.org/directory
+        acme_version: 2
+        terms_agreed: True
+      register: ssl_challenge
+
+## Here we register some simpler variables to work with our challenge data 
+## in a friendly way
+    - name: Prepare challenges
+      set_fact:
+        challenge_one: "{{ ssl_challenge['challenge_data'].items()[1][1]['dns-01'].resource_value }}"
+        challenge_two: "{{ ssl_challenge['challenge_data'].items()[0][1]['dns-01'].resource_value }}"
+
+## This replaces all TXT records named _acme-challenge for the domain with 
+## our updated challenge. The TTL can be anything over 600. TTL must be at 
+## least 600, this is a GoDaddy requirement.
+    - name: Update DNS records
+      uri:
+        url: https://api.godaddy.com/v1/domains/{{ ssl_domain }}/records/TXT/_acme-challenge
+        method: PUT
+        body: '[{"data": "{{ challenge_one }}","name": "_acme-challenge","ttl": 1800,"type": "TXT"},{"data": "{{ challenge_two }}","name": "_acme-challenge","ttl": 1800,"type": "TXT"}]'
+        body_format: json
+        status_code: 200
+        headers:
+          Authorization: "sso-key {{ api_key }}:{{ api_secret }}"
+          Content-Type: "application/json"
+          accept: "application/json"
+      when: ssl_challenge is changed
+
+## Sometimes DNS updates are not instant. We can't use GoDaddy's API to test 
+## because it will not reflect real-world results, so we dig. When our result 
+## matches our challenges, the DNS is ready.
+    - name: Loop until DNS is updated
+      shell: host -t txt _acme-challenge.{{ ssl_domain }}
+      when: ssl_challenge is changed
+      register: dns_check
+      until: dns_check.stdout.find("{{ challenge_one }}") != -1
+      retries: 300
+      delay: 60
+
+## Tells ACME to test our DNS records and issue our certificate    
+    - name: Issue Certificate
+      letsencrypt:
+        account_key_src: /etc/ssl/le/{{ ssl_domain }}/account.key
+        csr: /etc/ssl/le/{{ ssl_domain }}/csr
+        dest: /etc/ssl/le/{{ ssl_domain }}/certificate.crt
+        fullchain_dest: /etc/ssl/le/{{ ssl_domain }}/fullchain.crt
+        chain_dest: /etc/ssl/le/{{ ssl_domain }}/intermediate.crt
+        challenge: dns-01
+        data: "{{ ssl_challenge }}"
+        acme_directory: https://acme-v02.api.letsencrypt.org/directory
+        acme_version: 2
+
+## Lastly, we upload the certificate files to the server
+    - name: Install Certificate
+      shell: rsync -avzR -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {{ ssl_domain_port }} -i /home/you/.ssh/your_key" /etc/ssl/le/{{ ssl_domain }}/* root@{{ ssl_domain }}:/
+      force: yes
+
+## For multiple servers, create a cron job on the primary which 
+## synchronizes the /etc/ssl/le directory across all your machines using that domain.
